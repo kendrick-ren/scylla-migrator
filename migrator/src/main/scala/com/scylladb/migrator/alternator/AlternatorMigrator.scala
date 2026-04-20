@@ -1,7 +1,12 @@
 package com.scylladb.migrator.alternator
 
 import com.scylladb.migrator.{ readers, writers, DynamoUtils }
-import com.scylladb.migrator.config.{ MigratorConfig, SourceSettings, TargetSettings }
+import com.scylladb.migrator.config.{
+  MigratorConfig,
+  SourceSettings,
+  StreamChangesSetting,
+  TargetSettings
+}
 import com.scylladb.migrator.writers.DynamoStreamReplication
 import org.apache.hadoop.dynamodb.DynamoDBItemWritable
 import org.apache.hadoop.io.Text
@@ -11,6 +16,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.streaming.{ Seconds, StreamingContext }
 import software.amazon.awssdk.services.dynamodb.model.TableDescription
 
+import java.time.Instant
 import scala.util.control.NonFatal
 import scala.jdk.CollectionConverters._
 import scala.util.Using
@@ -25,7 +31,7 @@ object AlternatorMigrator {
   )(implicit spark: SparkSession): Unit = {
     val (sourceRDD, sourceTableDesc) =
       readers.DynamoDB.readRDD(spark, source, migratorConfig.skipSegments)
-    val maybeStreamedSource = if (target.streamChanges) Some(source) else None
+    val maybeStreamedSource = if (target.streamChanges.isEnabled) Some(source) else None
     migrate(sourceRDD, sourceTableDesc, maybeStreamedSource, target, migratorConfig)
   }
 
@@ -62,8 +68,8 @@ object AlternatorMigrator {
       sourceRDD.map { item =>
         (new Text(), new DynamoDBItemWritable(item.asJava))
       }
-    if (target.streamChanges) {
-      log.warn("'streamChanges: true' is not supported when the source is a DynamoDB S3 export.")
+    if (target.streamChanges.isEnabled) {
+      log.warn("'streamChanges' is not supported when the source is a DynamoDB S3 export.")
     }
     migrate(normalizedRDD, sourceTableDesc, None, target, migratorConfig)
   }
@@ -95,9 +101,24 @@ object AlternatorMigrator {
       val targetTableDesc = {
         for (streamedSource <- maybeStreamedSource) {
           log.info(
-            "Source is a Dynamo table and change streaming requested; enabling Dynamo Stream"
+            "Source is a Dynamo table and change streaming requested; enabling the configured stream"
           )
-          DynamoUtils.enableDynamoStream(streamedSource)
+          target.streamChanges match {
+            case StreamChangesSetting.DynamoDBStreams =>
+              DynamoUtils.enableDynamoStream(streamedSource)
+            case StreamChangesSetting.KinesisDataStreams(arn, _, _) =>
+              require(
+                streamedSource.region.isDefined,
+                "streamChanges.type=kinesis requires source.region to be explicitly set: the " +
+                  "Kinesis Data Streams KCL path needs a concrete region for both the Kinesis " +
+                  "data-plane client and the DynamoDB lease table. Add `region: <aws-region>` to " +
+                  "the source block in your config and retry."
+              )
+              DynamoUtils.enableKinesisStreamingDestination(streamedSource, arn)
+              DynamoUtils.waitForKinesisStreamingActive(streamedSource, arn)
+            case StreamChangesSetting.Disabled =>
+            // Unreachable: maybeStreamedSource is only populated when isEnabled is true.
+          }
         }
 
         DynamoUtils.replicateTableDefinition(
@@ -106,7 +127,13 @@ object AlternatorMigrator {
         )
       }
 
-      if (target.streamChanges && target.skipInitialSnapshotTransfer.contains(true)) {
+      // Snapshot start time, captured AFTER the stream is enabled so any change that lands
+      // during snapshot transfer is guaranteed to be in the stream, and BEFORE the snapshot
+      // begins so we don't miss events that happen while the snapshot is running. Used as the
+      // default Kinesis `AT_TIMESTAMP` initial position when streaming resumes.
+      val snapshotStartTime: Instant = Instant.now()
+
+      if (target.streamChanges.isEnabled && target.skipInitialSnapshotTransfer.contains(true)) {
         log.info("Skip transferring table snapshot")
       } else {
         Using.resource(DynamoDbSavepointsManager(migratorConfig, sourceRDD, spark.sparkContext)) {
@@ -127,7 +154,8 @@ object AlternatorMigrator {
           streamedSource,
           target,
           targetTableDesc,
-          migratorConfig.renamesMap
+          migratorConfig.renamesMap,
+          snapshotStartTime
         )
 
         streamingContext.start()

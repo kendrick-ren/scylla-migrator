@@ -39,7 +39,7 @@ import org.apache.spark.util.{ Clock, SystemClock }
   *   In order to use ManualClocks for the purpose of testing
   */
 private[kinesis] class KinesisDynamoDBCheckpointer(
-  receiver: KinesisDynamoDBReceiver[_],
+  receiver: AbstractKCLReceiver[_],
   checkpointInterval: Duration,
   workerId: String,
   clock: Clock = new SystemClock

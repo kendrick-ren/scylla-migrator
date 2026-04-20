@@ -48,7 +48,7 @@ import org.apache.spark.internal.Logging
   *   for logging purposes
   */
 private[kinesis] class KinesisDynamoDBRecordProcessor[T](
-  receiver: KinesisDynamoDBReceiver[T],
+  receiver: AbstractKCLReceiver[T],
   workerId: String
 ) extends IRecordProcessor with Logging {
 

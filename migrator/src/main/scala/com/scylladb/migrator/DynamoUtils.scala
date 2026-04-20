@@ -36,14 +36,20 @@ import software.amazon.awssdk.services.dynamodb.model.{
   BillingMode,
   CreateTableRequest,
   DeleteItemRequest,
+  DescribeKinesisStreamingDestinationRequest,
+  DescribeKinesisStreamingDestinationResponse,
   DescribeStreamRequest,
   DescribeTableRequest,
+  DestinationStatus,
+  DynamoDbException,
+  EnableKinesisStreamingDestinationRequest,
   GlobalSecondaryIndex,
   LocalSecondaryIndex,
   ProvisionedThroughput,
   ProvisionedThroughputDescription,
   PutItemRequest,
   QueryRequest,
+  ResourceInUseException,
   ResourceNotFoundException,
   ReturnConsumedCapacity,
   ScanRequest,
@@ -58,6 +64,7 @@ import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient
 
 import java.net.URI
 import java.util.stream.Collectors
+import scala.jdk.CollectionConverters._
 import scala.util.{ Failure, Success, Try }
 import scala.jdk.OptionConverters._
 
@@ -273,6 +280,161 @@ object DynamoUtils {
           s"Stream not yet enabled (status ${streamStatus}); waiting for 5 seconds and retrying"
         )
         Thread.sleep(5000)
+      }
+    }
+  }
+
+  /** Enable the Kinesis Data Streams destination on the source DynamoDB table.
+    *
+    * Mirrors [[enableDynamoStream]], but for the "Amazon Kinesis data stream details" side of the
+    * source table. The Kinesis stream itself must already exist. If the destination is already
+    * ACTIVE (or currently ENABLING), this method is a no-op.
+    */
+  def enableKinesisStreamingDestination(
+    source: SourceSettings.DynamoDB,
+    streamArn: String
+  ): Unit = {
+    val sourceClient =
+      buildDynamoClient(
+        source.endpoint,
+        source.finalCredentials.map(_.toProvider),
+        source.region,
+        if (source.removeConsumedCapacity.getOrElse(false))
+          Seq(new RemoveConsumedCapacityInterceptor)
+        else Nil,
+        source.alternator
+      )
+
+    val describeResp = sourceClient.describeKinesisStreamingDestination(
+      DescribeKinesisStreamingDestinationRequest.builder().tableName(source.table).build()
+    )
+    val existing =
+      describeResp.kinesisDataStreamDestinations().asScala.find(_.streamArn() == streamArn)
+
+    existing match {
+      case Some(d)
+          if d.destinationStatus() == DestinationStatus.ACTIVE ||
+            d.destinationStatus() == DestinationStatus.ENABLING =>
+        log.info(
+          s"Kinesis streaming destination for '${source.table}' -> '$streamArn' is already ${d.destinationStatus()}"
+        )
+      case _ =>
+        log.info(
+          s"Enabling Kinesis streaming destination '${source.table}' -> '$streamArn'"
+        )
+        try
+          sourceClient.enableKinesisStreamingDestination(
+            EnableKinesisStreamingDestinationRequest
+              .builder()
+              .tableName(source.table)
+              .streamArn(streamArn)
+              .build()
+          )
+        catch {
+          case _: ResourceInUseException =>
+            log.info(
+              s"Kinesis streaming destination already in use for '${source.table}' -> '$streamArn'"
+            )
+          case e: DynamoDbException
+              if Option(e.awsErrorDetails())
+                .map(_.errorCode())
+                .contains("ValidationException") &&
+                Option(e.getMessage).exists(_.contains("already enabled")) =>
+            log.info(
+              s"Kinesis streaming destination already enabled for '${source.table}' -> '$streamArn'"
+            )
+        }
+    }
+  }
+
+  /** Block until the Kinesis Data Streams destination for the given table / stream reaches the
+    * `ACTIVE` state. Throws [[java.util.concurrent.TimeoutException]] if `maxWait` elapses first,
+    * [[RuntimeException]] if it reaches `ENABLE_FAILED`.
+    *
+    * Transient AWS errors (throttling, 5xx) from `DescribeKinesisStreamingDestination` are retried
+    * up to 5 times with exponential backoff + jitter before being surfaced to the caller.
+    */
+  def waitForKinesisStreamingActive(
+    source: SourceSettings.DynamoDB,
+    streamArn: String,
+    maxWait: java.time.Duration = java.time.Duration.ofMinutes(15)
+  ): Unit = {
+    val sourceClient =
+      buildDynamoClient(
+        source.endpoint,
+        source.finalCredentials.map(_.toProvider),
+        source.region,
+        if (source.removeConsumedCapacity.getOrElse(false))
+          Seq(new RemoveConsumedCapacityInterceptor)
+        else Nil,
+        source.alternator
+      )
+
+    val deadline = java.time.Instant.now().plus(maxWait)
+    val rng = new scala.util.Random()
+    var transientAttempts = 0
+    val maxTransient = 5
+
+    while (true) {
+      val now = java.time.Instant.now()
+      if (now.isAfter(deadline)) {
+        throw new java.util.concurrent.TimeoutException(
+          s"Kinesis streaming destination for '${source.table}' -> '$streamArn' did not " +
+            s"reach ACTIVE within $maxWait"
+        )
+      }
+
+      val respOpt: Option[DescribeKinesisStreamingDestinationResponse] =
+        try
+          Some(
+            sourceClient.describeKinesisStreamingDestination(
+              DescribeKinesisStreamingDestinationRequest
+                .builder()
+                .tableName(source.table)
+                .build()
+            )
+          )
+        catch {
+          case e: DynamoDbException if transientAttempts < maxTransient =>
+            val backoffMs = (500L * (1L << transientAttempts.min(6))) + rng.nextInt(250)
+            log.warn(
+              s"DescribeKinesisStreamingDestination transient error (attempt " +
+                s"${transientAttempts + 1}/$maxTransient): ${e.getClass.getSimpleName}; " +
+                s"retrying in ${backoffMs}ms",
+              e
+            )
+            transientAttempts += 1
+            Thread.sleep(backoffMs)
+            None
+        }
+
+      respOpt.foreach { resp =>
+        val destination =
+          resp.kinesisDataStreamDestinations().asScala.find(_.streamArn() == streamArn)
+
+        destination match {
+          case Some(d) if d.destinationStatus() == DestinationStatus.ACTIVE =>
+            log.info(s"Kinesis streaming destination '$streamArn' is ACTIVE")
+            return
+          case Some(d) if d.destinationStatus() == DestinationStatus.ENABLE_FAILED =>
+            throw new RuntimeException(
+              s"Kinesis streaming destination enable failed for '$streamArn': " +
+                s"${Option(d.destinationStatusDescription()).getOrElse("<no description>")}"
+            )
+          case Some(d) =>
+            val sleepMs = 5000L + rng.nextInt(1000)
+            log.info(
+              s"Kinesis streaming destination '$streamArn' status = ${d.destinationStatus()}; " +
+                s"waiting ${sleepMs}ms (deadline: $deadline)"
+            )
+            Thread.sleep(sleepMs)
+            transientAttempts = 0
+          case None =>
+            throw new RuntimeException(
+              s"Kinesis streaming destination for '${source.table}' -> '$streamArn' " +
+                "was not found in DescribeKinesisStreamingDestination"
+            )
+        }
       }
     }
   }

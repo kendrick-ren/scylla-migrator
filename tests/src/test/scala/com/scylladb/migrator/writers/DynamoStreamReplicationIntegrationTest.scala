@@ -2,7 +2,12 @@ package com.scylladb.migrator.writers
 
 import com.amazonaws.services.dynamodbv2.model.{ AttributeValue => AttributeValueV1 }
 import com.scylladb.migrator.AttributeValueUtils
-import com.scylladb.migrator.config.{ AWSCredentials, DynamoDBEndpoint, TargetSettings }
+import com.scylladb.migrator.config.{
+  AWSCredentials,
+  DynamoDBEndpoint,
+  StreamChangesSetting,
+  TargetSettings
+}
 import org.apache.log4j.{ Level, Logger }
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
@@ -19,9 +24,12 @@ class DynamoStreamReplicationIntegrationTest extends MigratorSuiteWithDynamoDBLo
     SparkSession.builder().appName("test").master("local[*]").getOrCreate()
 
   private val tableName = "DynamoStreamReplicationIntegrationTest"
-  private val operationTypeColumn = "_dynamo_op_type"
-  private val putOperation = new AttributeValueV1().withBOOL(true)
-  private val deleteOperation = new AttributeValueV1().withBOOL(false)
+  // Reference the single source of truth for the op-type marker so a rename in
+  // DynamoStreamReplication cannot silently drift the test fixture away from it (which would
+  // make tests green while flipping every put into a delete in real runs).
+  private val operationTypeColumn = DynamoStreamReplication.operationTypeColumn
+  private val putOperation = DynamoStreamReplication.putOperation
+  private val deleteOperation = DynamoStreamReplication.deleteOperation
 
   def scanAll(client: DynamoDbClient, tableName: String): List[Map[String, AttributeValue]] =
     client
@@ -137,7 +145,7 @@ class DynamoStreamReplicationIntegrationTest extends MigratorSuiteWithDynamoDBLo
         region                      = Some("eu-central-1"),
         endpoint                    = Some(DynamoDBEndpoint("http://localhost", 8000)),
         credentials                 = Some(AWSCredentials("dummy", "dummy", None)),
-        streamChanges               = false,
+        streamChanges               = StreamChangesSetting.Disabled,
         skipInitialSnapshotTransfer = Some(true),
         writeThroughput             = None,
         throughputWritePercent      = None
